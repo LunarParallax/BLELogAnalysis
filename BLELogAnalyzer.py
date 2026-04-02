@@ -1,38 +1,40 @@
+"""BLE Log Analyzer - Analyze BLE state from pcapng captures.
+
+This module provides comprehensive analysis of Bluetooth Low Energy (BLE)
+communications captured in pcapng format, including advertising, connection,
+and ATT protocol analysis.
+"""
+
 import logging
-import pyshark
-import argparse
-import json
-import yaml
-import os
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 import nest_asyncio
 import numpy as np
+import pyshark
+import yaml
 from PacketInfo import PacketInfo
 
-# Basic logging configuration
-logging.basicConfig(level=logging.INFO,format='%(levelname)s: %(message)s')
-log = logging.getLogger(__name__)
+# Module-level constants
+BLE_DEV_ADDR_PACKET_PATHS: List[str] = ["btle.advertising.address"]
+BLE_PDU_TYPE_PACKET_PATHS: List[str] = ["btle.advertising.header.pdu.type"]
+BLE_CONTROL_OPCODE_PATHS: List[str] = ["btle.control.opcode"]
+BLE_ATT_OPCODE_PATHS: List[str] = ["btatt.opcode.method"]
 
-ble_dev_addr_packet_paths = [
-    "btle.advertising.address"
-]
-ble_pdu_type_packet_paths = [
-    "btle.advertising.header.pdu.type"
-]
-ble_pdu_type_labels = {
-    0: "ADV_IND", 
+BLE_PDU_TYPE_LABELS: Dict[int, str] = {
+    0: "ADV_IND",
     1: "ADV_DIRECT_IND",
     2: "ADV_NONCONN_IND",
-    3: "SCAN_REQ", 
+    3: "SCAN_REQ",
     4: "SCAN_RESP",
     5: "CONNECT_IND",
     6: "ADV_SCAN_IND",
     7: "ADV_EXT_IND",
-    8: "AUX_CONNECT_RSP"
+    8: "AUX_CONNECT_RSP",
 }
-ble_control_opcode_paths = [
-    "btle.control.opcode"
-]
-ble_control_opcode_labels = {
+
+BLE_CONTROL_OPCODE_LABELS: Dict[int, str] = {
     0: "LL_CONNECTION_UPDATE_IND",
     1: "LL_CHANNEL_MAP_IND",
     2: "LL_TERMINATE_IND",
@@ -65,29 +67,28 @@ ble_control_opcode_labels = {
     29: "LL_CLOCK_ACCURACY_REQ",
     30: "LL_CLOCK_ACCURACY_RSP",
 }
-ble_feature_req_bits = [
-    ["LE Encryption","ENC", False],
-    ["Connection Parameters Request Procedure","CPRP", False],
-    ["Extended Reject Indication","EXTREJ", False],
-    ["Slave-initiated Features Exchange","SLVFEAT", False],
-    ["LE Ping","PING", False],
-    ["LE Data Packet Length Extension","DLE", True],
-    ["LL Privacy","PRIV", False],
-    ["Extended Scanner Filter Policies","SCANFILT", False],
-    ["LE 2M PHY","2M", True],
-    ["Stable Modulation Index - Transmitter","STMODTX", False],
-    ["Stable Modulation Index - Receiver","STMODRX", False],
-    ["LE Coded PHY","CODED", True],
-    ["LE Extended Advertising","EXTADV", False],
-    ["LE Periodic Advertising","PERADV", False],
-    ["Channel Selection Algorithm #2","CHSEL2", False],
-    ["LE Power Class 1","PWRC1", False],
-    ["Minimum Number of Used Channels Procedure","MINCHPROC", False],
+
+BLE_FEATURE_REQ_BITS: List[List[Union[str, bool]]] = [
+    ["LE Encryption", "ENC", False],
+    ["Connection Parameters Request Procedure", "CPRP", False],
+    ["Extended Reject Indication", "EXTREJ", False],
+    ["Slave-initiated Features Exchange", "SLVFEAT", False],
+    ["LE Ping", "PING", False],
+    ["LE Data Packet Length Extension", "DLE", True],
+    ["LL Privacy", "PRIV", False],
+    ["Extended Scanner Filter Policies", "SCANFILT", False],
+    ["LE 2M PHY", "2M", True],
+    ["Stable Modulation Index - Transmitter", "STMODTX", False],
+    ["Stable Modulation Index - Receiver", "STMODRX", False],
+    ["LE Coded PHY", "CODED", True],
+    ["LE Extended Advertising", "EXTADV", False],
+    ["LE Periodic Advertising", "PERADV", False],
+    ["Channel Selection Algorithm #2", "CHSEL2", False],
+    ["LE Power Class 1", "PWRC1", False],
+    ["Minimum Number of Used Channels Procedure", "MINCHPROC", False],
 ]
-ble_att_opcode_paths = [
-    "btatt.opcode.method"
-]
-ble_att_method_labels = {
+
+BLE_ATT_METHOD_LABELS: Dict[int, str] = {
     1: "ATT_ERROR_RSP",
     2: "ATT_EXCHANGE_MTU_REQ",
     3: "ATT_EXCHANGE_MTU_RSP",
@@ -120,34 +121,82 @@ ble_att_method_labels = {
     0xD2: "ATT_WRITE_CMD_SIGNED",
 }
 
-class BLEStateAnalyzer:
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+log: logging.Logger = logging.getLogger(__name__)
 
-    def __init__(self, config_data,
-                ble_services,
-                ble_characteristics,
-                ble_declarations,
-                ble_descriptors,
-                bleDeviceAddr = "") -> None:
+
+class BLEStateAnalyzer:
+    """Analyzes BLE state from packet captures.
+
+    Attributes:
+        config_data: Configuration data from JSON file
+        ble_services: Dictionary of BLE service UUIDs
+        ble_characteristics: Dictionary of BLE characteristic UUIDs
+        ble_declarations: Dictionary of BLE declaration UUIDs
+        ble_descriptors: Dictionary of BLE descriptor UUIDs
+        ble_device_addr: Target BLE device address to analyze
+        state_sequence: List of captured state sequences
+        cur_state: Current state being analyzed
+    """
+
+    def __init__(
+        self,
+        config_data: Dict[str, Any],
+        ble_services: Dict[str, str],
+        ble_characteristics: Dict[str, str],
+        ble_declarations: Dict[str, str],
+        ble_descriptors: Dict[str, str],
+        ble_device_addr: str = ""
+    ) -> None:
+        """Initialize the BLE state analyzer.
+
+        Args:
+            config_data: Configuration dictionary
+            ble_services: BLE service UUID mappings
+            ble_characteristics: BLE characteristic UUID mappings
+            ble_declarations: BLE declaration UUID mappings
+            ble_descriptors: BLE descriptor UUID mappings
+            ble_device_addr: Optional BLE device address to filter on
+        """
         self.config_data = config_data
         self.ble_services = ble_services
         self.ble_characteristics = ble_characteristics
         self.ble_declarations = ble_declarations
         self.ble_descriptors = ble_descriptors
-        self.bleDeviceAddr = bleDeviceAddr
-        if self.bleDeviceAddr == "":
-            if "bleDeviceAddr" in self.config_data:
-                self.bleDeviceAddr = self.config_data["bleDeviceAddr"]
-        self.state_sequence = []
-        self.cur_state = {}
+        self.ble_device_addr = ble_device_addr
+        if not self.ble_device_addr and "bleDeviceAddr" in self.config_data:
+            self.ble_device_addr = self.config_data["bleDeviceAddr"]
+        self.state_sequence: List[Dict[str, Any]] = []
+        self.cur_state: Dict[str, Any] = {}
 
-    def timeFormat(self, timestamp):
+    def time_format(self, timestamp: float) -> str:
+        """Format timestamp to 3 decimal places.
+
+        Args:
+            timestamp: Time value in seconds
+
+        Returns:
+            Formatted timestamp string
+        """
         return f"{timestamp:.3f}"
-        
-    def checkPacketPath(self, pysh_pkt, packetPaths):
-        for packetPath in packetPaths:
+
+    def check_packet_path(
+        self, pysh_pkt: Any, packet_paths: List[str]
+    ) -> Tuple[bool, Optional[Any], Optional[str]]:
+        """Check if a packet has any of the specified paths.
+
+        Args:
+            pysh_pkt: PyShark packet object
+            packet_paths: List of attribute paths to check
+
+        Returns:
+            Tuple of (found, value, path) where found indicates if path exists
+        """
+        for packet_path in packet_paths:
             field_ok = True
-            fields = packetPath.split(".")
-            obt_to_test = pysh_pkt
+            fields = packet_path.split(".")
+            obt_to_test: Any = pysh_pkt
             for field in fields:
                 if hasattr(obt_to_test, field):
                     obt_to_test = getattr(obt_to_test, field)
@@ -155,49 +204,64 @@ class BLEStateAnalyzer:
                     field_ok = False
                     break
             if field_ok:
-                return field_ok, obt_to_test, packetPath
+                return field_ok, obt_to_test, packet_path
         return False, None, None
 
-    def getAdvInfo(self, pdu_types):
+    def get_adv_info(self, pdu_types: tuple) -> str:
+        """Get advertising information from PDU types.
+
+        Args:
+            pdu_types: Histogram of PDU type occurrences
+
+        Returns:
+            Formatted string with PDU type information
+        """
         adv_info = ""
-        for i in range(0, len(pdu_types[0])):
+        for i in range(len(pdu_types[0])):
             if pdu_types[0][i] > 0:
-                adv_info += f"{ble_pdu_type_labels[i]} {pdu_types[0][i]} "
+                adv_info += f"{BLE_PDU_TYPE_LABELS[i]} {pdu_types[0][i]} "
         return adv_info
-    
-    def handleEndOfAdvState(self):  
+
+    def handle_end_of_adv_state(self) -> None:
+        """Handle end of advertising state and summarize."""
         # Get average interval between ADV_IND packets
-        advIndIntervals = None
+        adv_ind_intervals: Optional[np.ndarray] = None
         if "advIndTimes" in self.cur_state:
-            advIndTimes = np.array(self.cur_state["advIndTimes"])
-            advIndIntervals = advIndTimes[1:] - advIndTimes[:-1]
-            advIndIntervals = advIndIntervals * 1000
-            advIndIntervals = np.round(advIndIntervals)
+            adv_ind_times = np.array(self.cur_state["advIndTimes"])
+            adv_ind_intervals = adv_ind_times[1:] - adv_ind_times[:-1]
+            adv_ind_intervals = adv_ind_intervals * 1000
+            adv_ind_intervals = np.round(adv_ind_intervals)
         # Summarize activity to this point if any
         if "pduType" in self.cur_state:
-            pdu_types = np.histogram(self.cur_state["pduType"], bins=range(0, len(ble_pdu_type_labels)))
+            pdu_types = np.histogram(
+                self.cur_state["pduType"], bins=range(len(BLE_PDU_TYPE_LABELS))
+            )
             out_str = f"{self.cur_state['firstPktTime']} {self.cur_state['firstPktNum']}-{self.cur_state['lastPktNum']} "
-            out_str += f"Advertising "
-            if advIndIntervals is not None:
-                out_str += f"Interval {np.mean(advIndIntervals):.0f}ms "
-            out_str += f"{self.getAdvInfo(pdu_types)}"
+            out_str += "Advertising "
+            if adv_ind_intervals is not None:
+                out_str += f"Interval {np.mean(adv_ind_intervals):.0f}ms "
+            out_str += f"{self.get_adv_info(pdu_types)}"
             log.debug(out_str)
             self.state_sequence.append(self.cur_state)
             self.cur_state = {}
-    
-    def summarizeConnection(self, conn_info):
-        # Summarize connection
+
+    def _summarize_connection(self, conn_info: Dict[str, Any]) -> None:
+        """Summarize connection information including features and throughput.
+
+        Args:
+            conn_info: Connection state dictionary with feature/data information
+        """
         # Features
         if "FEATURE_RSP" in conn_info:
             log.info(f"IMPORTANT FEATURES {conn_info['FEATURE_RSP']}")
 
         # DLE
         if "DLE" in conn_info:
-            txMax = conn_info["DLE"]["txMax"]
-            txTime = conn_info["DLE"]["txTime"]
-            rxMax = conn_info["DLE"]["rxMax"]
-            rxTime = conn_info["DLE"]["rxTime"]
-            log.info(f"DLE (Data Length Extension) TxMax {txMax} TxTime {txTime} RxMax {rxMax} RxTime {rxTime}")
+            dle = conn_info["DLE"]
+            log.info(
+                f"DLE (Data Length Extension) TxMax {dle['txMax']} "
+                f"TxTime {dle['txTime']} RxMax {dle['rxMax']} RxTime {dle['rxTime']}"
+            )
 
         # MTU
         if "RX_MTU" in conn_info:
@@ -512,10 +576,18 @@ class BLEStateAnalyzer:
             out_str += f"ATT method {method}"
         log.debug(out_str)
 
-    def handlePacket(self, pysh_pkt, packet_info: PacketInfo):
+    def handlePacket(self, pysh_pkt: Any, packet_info: PacketInfo) -> None:
+        """Process a single BLE packet.
+
+        Args:
+            pysh_pkt: PyShark packet object
+            packet_info: Packet metadata (number, timestamp)
+        """
         # Check if device address is to be discovered
-        if self.bleDeviceAddr == "":
-            field_ok, field_val, _ = self.checkPacketPath(pysh_pkt, ble_dev_addr_packet_paths)
+        if not self.ble_device_addr:
+            field_ok, field_val, _ = self.check_packet_path(
+                pysh_pkt, BLE_DEV_ADDR_PACKET_PATHS
+            )
             if field_ok:
                 self.bleDeviceAddr = field_val
                 log.debug(f"BLE device address: {self.bleDeviceAddr}")
