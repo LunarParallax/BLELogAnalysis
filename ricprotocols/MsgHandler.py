@@ -1,56 +1,96 @@
+"""Message handler for processing HDLC-encoded RIC protocol messages."""
+
+from typing import Callable, Optional, TextIO
 from martypy import LikeHDLC, RICProtocols
 from PacketInfo import PacketInfo
 
+
 class MsgHandler:
-    def __init__(self, prefix, outfile, onMsg, onError=None):
-        self.hdlc = LikeHDLC.LikeHDLC(self.onFrameRx, self.onError)
-        self.ricProtocols = RICProtocols.RICProtocols()
-        self.onMsg = onMsg
-        self.onError = onError
-        self.lastPacketInfo: PacketInfo = None
-        self.debugInFrame = False
-        self.debugLastCharWasE7 = False
-        self.debugCurLine = ""
+    """Handles HDLC frame decoding and RIC protocol message processing.
+    
+    Attributes:
+        hdlc: HDLC decoder instance
+        ric_protocols: RIC protocols decoder
+        on_msg: Callback function for decoded messages
+        on_error: Optional callback function for errors
+        last_packet_info: Most recent packet information
+        prefix: Prefix string for output
+        outfile: Output file handle for logging
+    """
+    
+    def __init__(
+        self,
+        prefix: str,
+        outfile: TextIO,
+        on_msg: Callable,
+        on_error: Optional[Callable] = None
+    ) -> None:
+        """Initialize the message handler.
+        
+        Args:
+            prefix: Prefix string for output lines
+            outfile: File handle for writing output
+            on_msg: Callback function invoked when a message is decoded
+            on_error: Optional callback function invoked on HDLC errors
+        """
+        self.hdlc = LikeHDLC.LikeHDLC(self._on_frame_rx, self._on_error)
+        self.ric_protocols = RICProtocols.RICProtocols()
+        self.on_msg = on_msg
+        self._on_error_callback = on_error
+        self.last_packet_info: Optional[PacketInfo] = None
+        self.debug_in_frame = False
+        self.debug_last_char_was_e7 = False
+        self.debug_cur_line = ""
         self.prefix = prefix
         self.outfile = outfile
-        self.debugCurHex = ""
+        self.debug_cur_hex = ""
 
-    def onFrameRx(self, frame):
-        # print(f"Frame received: {frame}")
-        msg = self.ricProtocols.decodeRICFrame(frame)
-        # print(self.lastFrameTime, msg.msgNum, len(msg.payload))
-        if self.onMsg is not None:
-            self.onMsg(msg, self.lastPacketInfo)
+    def _on_frame_rx(self, frame: bytes) -> None:
+        """Handle received HDLC frame.
+        
+        Args:
+            frame: Raw frame bytes received from HDLC decoder
+        """
+        msg = self.ric_protocols.decode_ric_frame(frame)
+        if self.on_msg is not None:
+            self.on_msg(msg, self.last_packet_info)
 
-    def onError(self):
+    def _on_error(self) -> None:
+        """Handle HDLC decoding error."""
         self.outfile.write("<<CRC>>")
-        # print(f"HDLC Error")
-        if self.onError is not None:
-            self.onError()
+        if self._on_error_callback is not None:
+            self._on_error_callback()
 
-    def handle(self, msg, packetInfo: PacketInfo):
-        self.lastPacketInfo = packetInfo
+    def handle(self, msg: bytes, packet_info: PacketInfo) -> None:
+        """Process a message byte-by-byte through the HDLC decoder.
+        
+        Args:
+            msg: Message bytes to process
+            packet_info: Packet metadata (number, timestamp)
+        """
+        self.last_packet_info = packet_info
+        
         for byte in msg:
-            self.debugCurHex += f"{byte:02x}"
+            self.debug_cur_hex += f"{byte:02x}"
+            
             if byte == 0xe7:
                 self.outfile.write("<<E7>>")
-                if self.debugLastCharWasE7 or not self.debugInFrame:
-                    self.debugInFrame = True
+                if self.debug_last_char_was_e7 or not self.debug_in_frame:
+                    self.debug_in_frame = True
                 else:
-                    if self.debugInFrame:
-                        self.outfile.write(self.prefix + " ")
-                        self.outfile.write(self.debugCurHex)
-                        if self.debugCurLine != "":
-                            self.outfile.write(" --- " + self.debugCurLine + "\n")
-                            # print(f" --- {self.debugCurLine}")
-                    self.debugCurLine = ""
-                    self.debugCurHex = ""
-                    self.debugInFrame = False
-                self.debugLastCharWasE7 = True
+                    if self.debug_in_frame:
+                        self.outfile.write(f"{self.prefix} {self.debug_cur_hex}")
+                        if self.debug_cur_line:
+                            self.outfile.write(f" --- {self.debug_cur_line}\n")
+                    self.debug_cur_line = ""
+                    self.debug_cur_hex = ""
+                    self.debug_in_frame = False
+                self.debug_last_char_was_e7 = True
             else:
-                if not self.debugInFrame:
+                if not self.debug_in_frame:
                     self.outfile.write("<@>")
-                    # print("<@@@@@@@@>")
-                self.debugLastCharWasE7 = False
-            self.debugCurLine += chr(byte) if byte > 32 and byte < 128 else '.'
-            self.hdlc.decodeData(byte)
+                self.debug_last_char_was_e7 = False
+            
+            # Add printable character or '.' for non-printable
+            self.debug_cur_line += chr(byte) if 32 < byte < 128 else '.'
+            self.hdlc.decode_data(byte)

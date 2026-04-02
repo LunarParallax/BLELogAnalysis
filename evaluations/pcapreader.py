@@ -1,42 +1,36 @@
+"""Read and parse pcap files using scapy."""
+
 import sys
-import re
-from scapy.all import *
-from memory_profiler import profile
+from typing import List
+from scapy.all import rdpcap
 
 
-# @profile
-# def get_url_from_payload(payload):
-#     http_header_regex = r"(?P<name>.*?): (?P<value>.*?)\r\n"
-#     start = payload.index(b"GET ") +4
-#     end = payload.index(b" HTTP/1.1")
-#     url_path = payload[start:end].decode("utf8")
-#     http_header_raw = payload[:payload.index(b"\r\n\r\n") + 2 ]
-#     http_header_parsed = dict(re.findall(http_header_regex, http_header_raw.decode("utf8")))
-#     url = http_header_parsed["Host"] + url_path + "\n"
-#     return url
-
-@profile
-def parse_pcap(pcap_path, urls_file):
+def parse_pcap(pcap_path: str, urls_file: str) -> None:
+    """Parse a pcap file and extract information.
+    
+    Args:
+        pcap_path: Path to the pcap/pcapng file
+        urls_file: Output file path (currently unused)
+    """
     pcap_flow = rdpcap(pcap_path)
     sessions = pcap_flow.sessions()
-    # urls_output = open(urls_file, "wb")
+    
     for session in sessions:
         for packet in sessions[session]:
             print(packet.show())
-            # try:
-            #     if packet[TCP].dport == 80:
-            #         payload = bytes(packet[TCP].payload)
-            #         url = get_url_from_payload(payload)
-            #         urls_output.write(url.encode())
-            # except Exception as e:
-            #     pass
-    # urls_output.close()
 
-def main(arguments):
-    # if len(arguments) == 5:
-    #     if arguments[1] == "--pcap" and arguments[3] == "--output":
-    #         parse_pcap(arguments[2], arguments[4])
-    parse_pcap(R"C:\Users\rob\Downloads\Asus C232N WebApp Rev5 v1.2.46 + 1st Attempt.pcapng", "test.txt")
+
+def main(arguments: List[str]) -> None:
+    """Main entry point.
+    
+    Args:
+        arguments: Command line arguments (currently uses hardcoded path)
+    """
+    # Example usage with hardcoded path
+    pcap_path = r"C:\Users\rob\Downloads\Asus C232N WebApp Rev5 v1.2.46 + 1st Attempt.pcapng"
+    output_file = "test.txt"
+    parse_pcap(pcap_path, output_file)
+
 
 if __name__ == "__main__":
     main(sys.argv)
