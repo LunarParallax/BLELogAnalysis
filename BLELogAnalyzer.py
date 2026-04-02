@@ -1,38 +1,40 @@
+"""BLE Log Analyzer - Analyze BLE state from pcapng captures.
+
+This module provides comprehensive analysis of Bluetooth Low Energy (BLE)
+communications captured in pcapng format, including advertising, connection,
+and ATT protocol analysis.
+"""
+
 import logging
-import pyshark
-import argparse
-import json
-import yaml
-import os
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 import nest_asyncio
 import numpy as np
+import pyshark
+import yaml
 from PacketInfo import PacketInfo
 
-# Basic logging configuration
-logging.basicConfig(level=logging.INFO,format='%(levelname)s: %(message)s')
-log = logging.getLogger(__name__)
+# Module-level constants
+BLE_DEV_ADDR_PACKET_PATHS: List[str] = ["btle.advertising.address"]
+BLE_PDU_TYPE_PACKET_PATHS: List[str] = ["btle.advertising.header.pdu.type"]
+BLE_CONTROL_OPCODE_PATHS: List[str] = ["btle.control.opcode"]
+BLE_ATT_OPCODE_PATHS: List[str] = ["btatt.opcode.method"]
 
-ble_dev_addr_packet_paths = [
-    "btle.advertising.address"
-]
-ble_pdu_type_packet_paths = [
-    "btle.advertising.header.pdu.type"
-]
-ble_pdu_type_labels = {
-    0: "ADV_IND", 
+BLE_PDU_TYPE_LABELS: Dict[int, str] = {
+    0: "ADV_IND",
     1: "ADV_DIRECT_IND",
     2: "ADV_NONCONN_IND",
-    3: "SCAN_REQ", 
+    3: "SCAN_REQ",
     4: "SCAN_RESP",
     5: "CONNECT_IND",
     6: "ADV_SCAN_IND",
     7: "ADV_EXT_IND",
-    8: "AUX_CONNECT_RSP"
+    8: "AUX_CONNECT_RSP",
 }
-ble_control_opcode_paths = [
-    "btle.control.opcode"
-]
-ble_control_opcode_labels = {
+
+BLE_CONTROL_OPCODE_LABELS: Dict[int, str] = {
     0: "LL_CONNECTION_UPDATE_IND",
     1: "LL_CHANNEL_MAP_IND",
     2: "LL_TERMINATE_IND",
@@ -65,29 +67,28 @@ ble_control_opcode_labels = {
     29: "LL_CLOCK_ACCURACY_REQ",
     30: "LL_CLOCK_ACCURACY_RSP",
 }
-ble_feature_req_bits = [
-    ["LE Encryption","ENC", False],
-    ["Connection Parameters Request Procedure","CPRP", False],
-    ["Extended Reject Indication","EXTREJ", False],
-    ["Slave-initiated Features Exchange","SLVFEAT", False],
-    ["LE Ping","PING", False],
-    ["LE Data Packet Length Extension","DLE", True],
-    ["LL Privacy","PRIV", False],
-    ["Extended Scanner Filter Policies","SCANFILT", False],
-    ["LE 2M PHY","2M", True],
-    ["Stable Modulation Index - Transmitter","STMODTX", False],
-    ["Stable Modulation Index - Receiver","STMODRX", False],
-    ["LE Coded PHY","CODED", True],
-    ["LE Extended Advertising","EXTADV", False],
-    ["LE Periodic Advertising","PERADV", False],
-    ["Channel Selection Algorithm #2","CHSEL2", False],
-    ["LE Power Class 1","PWRC1", False],
-    ["Minimum Number of Used Channels Procedure","MINCHPROC", False],
+
+BLE_FEATURE_REQ_BITS: List[List[Union[str, bool]]] = [
+    ["LE Encryption", "ENC", False],
+    ["Connection Parameters Request Procedure", "CPRP", False],
+    ["Extended Reject Indication", "EXTREJ", False],
+    ["Slave-initiated Features Exchange", "SLVFEAT", False],
+    ["LE Ping", "PING", False],
+    ["LE Data Packet Length Extension", "DLE", True],
+    ["LL Privacy", "PRIV", False],
+    ["Extended Scanner Filter Policies", "SCANFILT", False],
+    ["LE 2M PHY", "2M", True],
+    ["Stable Modulation Index - Transmitter", "STMODTX", False],
+    ["Stable Modulation Index - Receiver", "STMODRX", False],
+    ["LE Coded PHY", "CODED", True],
+    ["LE Extended Advertising", "EXTADV", False],
+    ["LE Periodic Advertising", "PERADV", False],
+    ["Channel Selection Algorithm #2", "CHSEL2", False],
+    ["LE Power Class 1", "PWRC1", False],
+    ["Minimum Number of Used Channels Procedure", "MINCHPROC", False],
 ]
-ble_att_opcode_paths = [
-    "btatt.opcode.method"
-]
-ble_att_method_labels = {
+
+BLE_ATT_METHOD_LABELS: Dict[int, str] = {
     1: "ATT_ERROR_RSP",
     2: "ATT_EXCHANGE_MTU_REQ",
     3: "ATT_EXCHANGE_MTU_RSP",
@@ -120,34 +121,85 @@ ble_att_method_labels = {
     0xD2: "ATT_WRITE_CMD_SIGNED",
 }
 
-class BLEStateAnalyzer:
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+log: logging.Logger = logging.getLogger(__name__)
 
-    def __init__(self, config_data,
-                ble_services,
-                ble_characteristics,
-                ble_declarations,
-                ble_descriptors,
-                bleDeviceAddr = "") -> None:
+
+class BLEStateAnalyzer:
+    """Analyzes BLE state from packet captures.
+
+    Attributes:
+        config_data: Configuration data from JSON file
+        ble_services: Dictionary of BLE service UUIDs
+        ble_characteristics: Dictionary of BLE characteristic UUIDs
+        ble_declarations: Dictionary of BLE declaration UUIDs
+        ble_descriptors: Dictionary of BLE descriptor UUIDs
+        ble_device_addr: Target BLE device address to analyze
+        state_sequence: List of captured state sequences
+        cur_state: Current state being analyzed
+    """
+
+    def __init__(
+        self,
+        config_data: Dict[str, Any],
+        ble_services: Dict[str, str],
+        ble_characteristics: Dict[str, str],
+        ble_declarations: Dict[str, str],
+        ble_descriptors: Dict[str, str],
+        ble_device_addr: str = ""
+    ) -> None:
+        """Initialize the BLE state analyzer.
+
+        Args:
+            config_data: Configuration dictionary
+            ble_services: BLE service UUID mappings
+            ble_characteristics: BLE characteristic UUID mappings
+            ble_declarations: BLE declaration UUID mappings
+            ble_descriptors: BLE descriptor UUID mappings
+            ble_device_addr: Optional BLE device address to filter on
+        """
         self.config_data = config_data
         self.ble_services = ble_services
         self.ble_characteristics = ble_characteristics
         self.ble_declarations = ble_declarations
         self.ble_descriptors = ble_descriptors
-        self.bleDeviceAddr = bleDeviceAddr
-        if self.bleDeviceAddr == "":
-            if "bleDeviceAddr" in self.config_data:
-                self.bleDeviceAddr = self.config_data["bleDeviceAddr"]
-        self.state_sequence = []
-        self.cur_state = {}
+        self.ble_device_addr = ble_device_addr
+        if not self.ble_device_addr and "bleDeviceAddr" in self.config_data:
+            self.ble_device_addr = self.config_data["bleDeviceAddr"]
+        self.state_sequence: List[Dict[str, Any]] = []
+        self.cur_state: Dict[str, Any] = {}
 
-    def timeFormat(self, timestamp):
+    def time_format(self, timestamp: float) -> str:
+        """Format timestamp to 3 decimal places.
+
+        Args:
+            timestamp: Time value in seconds
+
+        Returns:
+            Formatted timestamp string
+        """
         return f"{timestamp:.3f}"
-        
-    def checkPacketPath(self, pysh_pkt, packetPaths):
-        for packetPath in packetPaths:
+    
+    # Alias for backward compatibility during refactoring
+    timeFormat = time_format
+
+    def check_packet_path(
+        self, pysh_pkt: Any, packet_paths: List[str]
+    ) -> Tuple[bool, Optional[Any], Optional[str]]:
+        """Check if a packet has any of the specified paths.
+
+        Args:
+            pysh_pkt: PyShark packet object
+            packet_paths: List of attribute paths to check
+
+        Returns:
+            Tuple of (found, value, path) where found indicates if path exists
+        """
+        for packet_path in packet_paths:
             field_ok = True
-            fields = packetPath.split(".")
-            obt_to_test = pysh_pkt
+            fields = packet_path.split(".")
+            obt_to_test: Any = pysh_pkt
             for field in fields:
                 if hasattr(obt_to_test, field):
                     obt_to_test = getattr(obt_to_test, field)
@@ -155,49 +207,67 @@ class BLEStateAnalyzer:
                     field_ok = False
                     break
             if field_ok:
-                return field_ok, obt_to_test, packetPath
+                return field_ok, obt_to_test, packet_path
         return False, None, None
 
-    def getAdvInfo(self, pdu_types):
+    def get_adv_info(self, pdu_types: tuple) -> str:
+        """Get advertising information from PDU types.
+
+        Args:
+            pdu_types: Histogram of PDU type occurrences
+
+        Returns:
+            Formatted string with PDU type information
+        """
         adv_info = ""
-        for i in range(0, len(pdu_types[0])):
+        for i in range(len(pdu_types[0])):
             if pdu_types[0][i] > 0:
-                adv_info += f"{ble_pdu_type_labels[i]} {pdu_types[0][i]} "
+                adv_info += f"{BLE_PDU_TYPE_LABELS[i]} {pdu_types[0][i]} "
         return adv_info
-    
-    def handleEndOfAdvState(self):  
+
+    def handle_end_of_adv_state(self) -> None:
+        """Handle end of advertising state and summarize."""
         # Get average interval between ADV_IND packets
-        advIndIntervals = None
+        adv_ind_intervals: Optional[np.ndarray] = None
         if "advIndTimes" in self.cur_state:
-            advIndTimes = np.array(self.cur_state["advIndTimes"])
-            advIndIntervals = advIndTimes[1:] - advIndTimes[:-1]
-            advIndIntervals = advIndIntervals * 1000
-            advIndIntervals = np.round(advIndIntervals)
+            adv_ind_times = np.array(self.cur_state["advIndTimes"])
+            adv_ind_intervals = adv_ind_times[1:] - adv_ind_times[:-1]
+            adv_ind_intervals = adv_ind_intervals * 1000
+            adv_ind_intervals = np.round(adv_ind_intervals)
         # Summarize activity to this point if any
         if "pduType" in self.cur_state:
-            pdu_types = np.histogram(self.cur_state["pduType"], bins=range(0, len(ble_pdu_type_labels)))
+            pdu_types = np.histogram(
+                self.cur_state["pduType"], bins=range(len(BLE_PDU_TYPE_LABELS))
+            )
             out_str = f"{self.cur_state['firstPktTime']} {self.cur_state['firstPktNum']}-{self.cur_state['lastPktNum']} "
-            out_str += f"Advertising "
-            if advIndIntervals is not None:
-                out_str += f"Interval {np.mean(advIndIntervals):.0f}ms "
-            out_str += f"{self.getAdvInfo(pdu_types)}"
+            out_str += "Advertising "
+            if adv_ind_intervals is not None:
+                out_str += f"Interval {np.mean(adv_ind_intervals):.0f}ms "
+            out_str += f"{self.get_adv_info(pdu_types)}"
             log.debug(out_str)
             self.state_sequence.append(self.cur_state)
             self.cur_state = {}
     
-    def summarizeConnection(self, conn_info):
-        # Summarize connection
+    # Alias for backward compatibility during refactoring
+    handleEndOfAdvState = handle_end_of_adv_state
+
+    def _summarize_connection(self, conn_info: Dict[str, Any]) -> None:
+        """Summarize connection information including features and throughput.
+
+        Args:
+            conn_info: Connection state dictionary with feature/data information
+        """
         # Features
         if "FEATURE_RSP" in conn_info:
             log.info(f"IMPORTANT FEATURES {conn_info['FEATURE_RSP']}")
 
         # DLE
         if "DLE" in conn_info:
-            txMax = conn_info["DLE"]["txMax"]
-            txTime = conn_info["DLE"]["txTime"]
-            rxMax = conn_info["DLE"]["rxMax"]
-            rxTime = conn_info["DLE"]["rxTime"]
-            log.info(f"DLE (Data Length Extension) TxMax {txMax} TxTime {txTime} RxMax {rxMax} RxTime {rxTime}")
+            dle = conn_info["DLE"]
+            log.info(
+                f"DLE (Data Length Extension) TxMax {dle['txMax']} "
+                f"TxTime {dle['txTime']} RxMax {dle['rxMax']} RxTime {dle['rxTime']}"
+            )
 
         # MTU
         if "RX_MTU" in conn_info:
@@ -261,80 +331,163 @@ class BLEStateAnalyzer:
                 rec = conn_summary[characteristic][msg_type]
                 log.info(f"{characteristic} {msg_type} Packets {rec['pktCount']} Bytes {rec['dataLen']}")
 
-    def handleConnInd(self, pysh_pkt, packet_info: PacketInfo):
-        # Handle end of advertising state if reequired
-        self.handleEndOfAdvState()
+    def _handle_conn_ind(self, pysh_pkt, packet_info: PacketInfo) -> None:
+        """Handle CONNECT_IND packet.
+        
+        Args:
+            pysh_pkt: PyShark packet object
+            packet_info: Packet information object
+        """
+        # Handle end of advertising state if required
+        self.handle_end_of_adv_state()
         # Connect indication
-        log.debug(f"{self.timeFormat(packet_info.timestamp)} {packet_info.num} CONNECT_IND")
+        log.debug(f"{self.time_format(packet_info.timestamp)} {packet_info.num} CONNECT_IND")
+    
+    # Aliases for backward compatibility during refactoring
+    handleConnInd = _handle_conn_ind
 
-    def handleTerminateInd(self, pysh_pkt):
+    def _handle_terminate_ind(self, pysh_pkt) -> None:
+        """Handle LL_TERMINATE_IND packet.
+        
+        Args:
+            pysh_pkt: PyShark packet object
+        """
         self.state_sequence.append(self.cur_state)
         self.cur_state = {}
+    
+    # Alias for backward compatibility during refactoring
+    handleTerminateInd = _handle_terminate_ind
 
-    def extractFeatures(self, pysh_pkt, feature_type):
+    def _extract_features(self, pysh_pkt, feature_type: str) -> str:
+        """Extract BLE feature flags from packet.
+        
+        Args:
+            pysh_pkt: PyShark packet object
+            feature_type: Type of feature to extract
+            
+        Returns:
+            String representation of features
+        """
         features = ""
         important_features = ""
-        featureSet = int(pysh_pkt.btle.control.feature.set.value)
+        feature_set = int(pysh_pkt.btle.control.feature.set.value)
         bitmask = 1
-        for i in range(0, len(ble_feature_req_bits)):
-            if featureSet & bitmask:
-                features += ble_feature_req_bits[i][1] + " "
-                if ble_feature_req_bits[i][2]:
-                    important_features += ble_feature_req_bits[i][1] + ":YES "
-            elif ble_feature_req_bits[i][2]:
-                features += f"({ble_feature_req_bits[i][1]}:NO) "
-                important_features += f"{ble_feature_req_bits[i][1]}:NO "
+        for i in range(0, len(BLE_FEATURE_REQ_BITS)):
+            if feature_set & bitmask:
+                features += BLE_FEATURE_REQ_BITS[i][1] + " "
+                if BLE_FEATURE_REQ_BITS[i][2]:
+                    important_features += BLE_FEATURE_REQ_BITS[i][1] + ":YES "
+            elif BLE_FEATURE_REQ_BITS[i][2]:
+                features += f"({BLE_FEATURE_REQ_BITS[i][1]}:NO) "
+                important_features += f"{BLE_FEATURE_REQ_BITS[i][1]}:NO "
             bitmask = bitmask << 1
         self.cur_state[feature_type] = important_features
         return features
     
-    def extractDLE(self, pysh_pkt):
-        txMax = pysh_pkt.btle.control.max.tx.octets
-        txTime = pysh_pkt.btle.control.max.tx.time
-        rxMax = pysh_pkt.btle.control.max.rx.octets
-        rxTime = pysh_pkt.btle.control.max.rx.time
-        self.cur_state["DLE"] = {
-            "txMax":txMax,
-            "txTime":txTime,
-            "rxMax":rxMax,
-            "rxTime":rxTime
-        }
-        return f"TxMax {txMax} TxTime {txTime} RxMax {rxMax} RxTime {rxTime}"
+    # Alias for backward compatibility during refactoring
+    extractFeatures = _extract_features
     
-    def extractInterval(self, pysh_pkt, interval_type):
+    def _extract_dle(self, pysh_pkt) -> str:
+        """Extract Data Length Extension parameters from packet.
+        
+        Args:
+            pysh_pkt: PyShark packet object
+            
+        Returns:
+            String representation of DLE parameters
+        """
+        tx_max = pysh_pkt.btle.control.max.tx.octets
+        tx_time = pysh_pkt.btle.control.max.tx.time
+        rx_max = pysh_pkt.btle.control.max.rx.octets
+        rx_time = pysh_pkt.btle.control.max.rx.time
+        self.cur_state["DLE"] = {
+            "txMax": tx_max,
+            "txTime": tx_time,
+            "rxMax": rx_max,
+            "rxTime": rx_time
+        }
+        return f"TxMax {tx_max} TxTime {tx_time} RxMax {rx_max} RxTime {rx_time}"
+    
+    # Alias for backward compatibility during refactoring
+    extractDLE = _extract_dle
+    
+    def _extract_interval(self, pysh_pkt, interval_type: str) -> tuple:
+        """Extract connection interval parameters from packet.
+        
+        Args:
+            pysh_pkt: PyShark packet object
+            interval_type: Type identifier for storage
+            
+        Returns:
+            Tuple of (interval, latency, timeout)
+        """
         interval = pysh_pkt.btle.control.interval
         latency = pysh_pkt.btle.control.latency
         timeout = pysh_pkt.btle.control.timeout
         self.cur_state[interval_type] = {
-            "interval":interval,
-            "latency":latency,
-            "timeout":timeout
+            "interval": interval,
+            "latency": latency,
+            "timeout": timeout
         }
         return interval, latency, timeout
     
-    def extractIntervalMinMax(self, pysh_pkt, interval_type):
+    # Alias for backward compatibility during refactoring
+    extractInterval = _extract_interval
+    
+    def _extract_interval_min_max(self, pysh_pkt, interval_type: str) -> tuple:
+        """Extract connection interval min/max parameters from packet.
+        
+        Args:
+            pysh_pkt: PyShark packet object
+            interval_type: Type identifier for storage
+            
+        Returns:
+            Tuple of (interval_min, interval_max, latency, timeout)
+        """
         interval_min = pysh_pkt.btle.control.interval.min
         interval_max = pysh_pkt.btle.control.interval.max
         latency = pysh_pkt.btle.control.latency
         timeout = pysh_pkt.btle.control.timeout
         self.cur_state[interval_type] = {
-            "interval_min":interval_min,
-            "interval_max":interval_max,
-            "latency":latency,
-            "timeout":timeout
+            "interval_min": interval_min,
+            "interval_max": interval_max,
+            "latency": latency,
+            "timeout": timeout
         }
         return interval_min, interval_max, latency, timeout
+    
+    # Alias for backward compatibility during refactoring
+    extractIntervalMinMax = _extract_interval_min_max
 
-    def extractPhy(self, pysh_pkt, phy_type):
+    def _extract_phy(self, pysh_pkt, phy_type: str) -> tuple:
+        """Extract PHY information from packet.
+        
+        Args:
+            pysh_pkt: PyShark packet object
+            phy_type: Type identifier for storage
+            
+        Returns:
+            Tuple of (phy, coded)
+        """
         phy = 2 if hasattr(pysh_pkt.btle.control, "phys") and pysh_pkt.btle.control.phys.le.get_field("2m").get_field("phy") else 1
         coded = hasattr(pysh_pkt.btle.control, "phys") and pysh_pkt.btle.control.phys.le.coded.phy
         self.cur_state[phy_type] = {
-            "phy":phy,
-            "coded":coded
+            "phy": phy,
+            "coded": coded
         }
         return phy, coded
     
-    def handleLLOpcode(self, opcode, pysh_pkt, packet_info: PacketInfo):
+    # Alias for backward compatibility during refactoring
+    extractPhy = _extract_phy
+    
+    def _handle_ll_opcode(self, opcode: int, pysh_pkt, packet_info: PacketInfo) -> None:
+        """Handle Link Layer control opcode.
+        
+        Args:
+            opcode: LL control opcode value
+            pysh_pkt: PyShark packet object
+            packet_info: Packet information object
+        """
         # Handle specific opcodes
         out_str = f"{self.timeFormat(packet_info.timestamp)} {packet_info.num} "
         if opcode == 0: # LL_CONNECTION_UPDATE_IND
@@ -399,15 +552,34 @@ class BLEStateAnalyzer:
             out_str += f"{packet_info.num} Opcode {opcode}"
         log.debug(out_str)
 
-    def getBTATTHandles(self, pysh_pkt):
+    def _get_bt_att_handles(self, pysh_pkt) -> str:
+        """Get Bluetooth ATT handles from packet.
+        
+        Args:
+            pysh_pkt: PyShark packet object
+            
+        Returns:
+            String representation of ATT handles
+        """
         if hasattr(pysh_pkt.btatt, "starting") and hasattr(pysh_pkt.btatt, "ending"):
             return f"{pysh_pkt.btatt.starting.handle} - {pysh_pkt.btatt.ending.handle}"
         elif hasattr(pysh_pkt.btatt, "handle"):
             return f"{pysh_pkt.btatt.handle}"
         else:
             return "Unknown"
+    
+    # Alias for backward compatibility during refactoring
+    getBTATTHandles = _get_bt_att_handles
 
-    def uuidLookup(self, uuid):
+    def _uuid_lookup(self, uuid: str) -> str:
+        """Look up UUID in known services/characteristics/descriptors.
+        
+        Args:
+            uuid: UUID string to look up
+            
+        Returns:
+            Human-readable name or hex representation
+        """
         if uuid in self.ble_services:
             return '"' + self.ble_services[uuid] + '"'
         if uuid in self.ble_characteristics:
@@ -423,53 +595,112 @@ class BLEStateAnalyzer:
             return '"' + self.config_data["uuids"][uuid_byte_reversed] + '"(REVERSED)'
         return "0x" + uuid
     
-    def getUUIDHexStr(self, rec):
+    # Alias for backward compatibility during refactoring
+    uuidLookup = _uuid_lookup
+    
+    def _get_uuid_hex_str(self, rec) -> str:
+        """Get UUID as hex string with optional name lookup.
+        
+        Args:
+            rec: Record containing UUID data
+            
+        Returns:
+            Formatted UUID string
+        """
         if hasattr(rec, "uuid128"):
             rec_uuid128 = rec.uuid128
             if isinstance(rec_uuid128, list):
-                uuidList = ""
+                uuid_list = ""
                 for uuid in rec_uuid128:
-                    uuidList += self.uuidLookup(f"{uuid.hex()}") + " "
-                return uuidList
+                    uuid_list += self._uuid_lookup(f"{uuid.hex()}") + " "
+                return uuid_list
             else:
-                return self.uuidLookup(f"{rec.uuid128.hex()}")
+                return self._uuid_lookup(f"{rec.uuid128.hex()}")
         elif hasattr(rec, "uuid16"):
             uuid16 = rec.uuid16
             if isinstance(uuid16, list):
-                uuidList = ""
+                uuid_list = ""
                 for uuid in uuid16:
-                    uuidList += self.uuidLookup(f"{uuid:04x}") + " "
+                    uuid_list += self._uuid_lookup(f"{uuid:04x}") + " "
+                return uuid_list
             else:
-                return self.uuidLookup(f"{rec.uuid16:04x}")
+                return self._uuid_lookup(f"{rec.uuid16:04x}")
         else:
             return "Unknown"
+    
+    # Alias for backward compatibility during refactoring
+    getUUIDHexStr = _get_uuid_hex_str
 
-    def getServiceUUID(self, btatt):
-        if hasattr(btatt, "service"):
-            return self.getUUIDHexStr(btatt.service)
-        return "Unknown"
+    def _get_service_uuid(self, btatt) -> str:
+        """Get service UUID from ATT packet.
+        
+        Args:
+            btatt: BTATT layer from packet
             
-    def getCharUUID(self, btatt):
+        Returns:
+            Service UUID string
+        """
+        if hasattr(btatt, "service"):
+            return self._get_uuid_hex_str(btatt.service)
+        return "Unknown"
+    
+    # Alias for backward compatibility during refactoring
+    getServiceUUID = _get_service_uuid
+        
+    def _get_char_uuid(self, btatt) -> str:
+        """Get characteristic UUID from ATT packet.
+        
+        Args:
+            btatt: BTATT layer from packet
+            
+        Returns:
+            Characteristic UUID string
+        """
         if hasattr(btatt, "characteristic"):
-            return self.getUUIDHexStr(btatt.characteristic)
-        return self.getUUIDHexStr(btatt)
+            return self._get_uuid_hex_str(btatt.characteristic)
+        return self._get_uuid_hex_str(btatt)
+    
+    # Alias for backward compatibility during refactoring
+    getCharUUID = _get_char_uuid
 
-    def getValueData(self, packet_info, btatt, msg_type, characteristic):
+    def _get_value_data(self, packet_info, btatt, msg_type: str, characteristic: str) -> str:
+        """Store and format value data from ATT packet.
+        
+        Args:
+            packet_info: Packet information object
+            btatt: BTATT layer from packet
+            msg_type: Type of message (READ_RSP, WRITE_REQ, etc.)
+            characteristic: Characteristic UUID
+            
+        Returns:
+            Formatted data string
+        """
         if hasattr(btatt, "value"):
             if "dataFrames" not in self.cur_state:
                 self.cur_state["dataFrames"] = []
             self.cur_state["dataFrames"].append(
                 {
-                    "time":packet_info.timestamp,
-                    "data":btatt.value,
-                    "type":msg_type,
-                    "characteristic":characteristic
-                })
-            return(f"Length {len(btatt.value)} Data {btatt.value.hex()}")
+                    "time": packet_info.timestamp,
+                    "data": btatt.value,
+                    "type": msg_type,
+                    "characteristic": characteristic
+                }
+            )
+            return f"Length {len(btatt.value)} Data {btatt.value.hex()}"
         else:
             return "No data"
+    
+    # Alias for backward compatibility during refactoring
+    getValueData = _get_value_data
 
-    def handleATTMethod(self, method, pysh_pkt, packet_info: PacketInfo):
+    def _handle_att_method(self, method: int, pysh_pkt, packet_info: PacketInfo) -> None:
+        """Handle ATT protocol method.
+        
+        Args:
+            method: ATT method opcode
+            pysh_pkt: PyShark packet object
+            packet_info: Packet information object
+        """
         out_str = f"{self.timeFormat(packet_info.timestamp)} {packet_info.num} "
         # Handle specific methods
         if method == 2: # ATT_MTU_REQ
@@ -512,10 +743,18 @@ class BLEStateAnalyzer:
             out_str += f"ATT method {method}"
         log.debug(out_str)
 
-    def handlePacket(self, pysh_pkt, packet_info: PacketInfo):
+    def handlePacket(self, pysh_pkt: Any, packet_info: PacketInfo) -> None:
+        """Process a single BLE packet.
+
+        Args:
+            pysh_pkt: PyShark packet object
+            packet_info: Packet metadata (number, timestamp)
+        """
         # Check if device address is to be discovered
-        if self.bleDeviceAddr == "":
-            field_ok, field_val, _ = self.checkPacketPath(pysh_pkt, ble_dev_addr_packet_paths)
+        if not self.ble_device_addr:
+            field_ok, field_val, _ = self.check_packet_path(
+                pysh_pkt, BLE_DEV_ADDR_PACKET_PATHS
+            )
             if field_ok:
                 self.bleDeviceAddr = field_val
                 log.debug(f"BLE device address: {self.bleDeviceAddr}")
@@ -552,26 +791,54 @@ class BLEStateAnalyzer:
         if field_ok:
             self.handleATTMethod(field_val, pysh_pkt, packet_info)
  
-    def showStats(self):
+    def _show_stats(self) -> None:
+        """Display statistics from analyzed packets."""
         for state in self.state_sequence:
             if "dataFrames" in state:
-                self.summarizeConnection(state)
-        # log.debug(self.cur_state)
+                self._summarize_connection(state)
+    
+    # Alias for backward compatibility during refactoring
+    showStats = _show_stats
 
-def readConfig(config_file_name):
-    # Read json config file
+def _read_config(config_file_name: str) -> Dict[str, Any]:
+    """Read JSON configuration file.
+    
+    Args:
+        config_file_name: Path to configuration file
+        
+    Returns:
+        Configuration dictionary
+    """
     with open(config_file_name) as config_file:
         config_data = json.load(config_file)
         return config_data
 
-def readYamlUUIDS(yaml_file_name):
-    # Read yaml file
+# Alias for backward compatibility during refactoring
+readConfig = _read_config
+
+def _read_yaml_uuids(yaml_file_name: str) -> Dict[str, str]:
+    """Read UUID mappings from YAML file.
+    
+    Args:
+        yaml_file_name: Path to YAML file
+        
+    Returns:
+        Dictionary mapping UUID hex strings to names
+    """
     with open(yaml_file_name) as yaml_file:
         yaml_data = yaml.load(yaml_file, Loader=yaml.FullLoader)
-        uuid_data = {f"{serv['uuid']:04x}":serv['name'] for serv in yaml_data["uuids"]}
+        uuid_data = {f"{serv['uuid']:04x}": serv['name'] for serv in yaml_data["uuids"]}
         return uuid_data
 
-def processFile(filename):
+# Alias for backward compatibility during refactoring
+readYamlUUIDS = _read_yaml_uuids
+
+def _process_file(filename: str) -> None:
+    """Process a single pcapng file.
+    
+    Args:
+        filename: Path to pcapng file
+    """
     cap = pyshark.FileCapture(filename, use_ek=True)
     bleStateAnalyzer = BLEStateAnalyzer(config_data, 
                                         ble_services, 
